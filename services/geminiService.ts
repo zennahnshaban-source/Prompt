@@ -1,5 +1,5 @@
-import { GoogleGenAI, GenerateContentResponse, Chat, Content } from "@google/genai";
-import { ChatMessage } from "../types";
+import { GoogleGenAI, GenerateContentResponse, Chat, Content, Part } from "@google/genai";
+import { ChatMessage, AISettings, Attachment } from "../types";
 
 const SYSTEM_INSTRUCTION = `
 你现在的身份是 **首席 Prompt 架构师 (Chief Prompt Architect)**，精通 LLM 原理与 Prompt Engineering 高级方法论（如 CO-STAR, CRISPE, Few-Shot, Chain-of-Thought）。
@@ -67,41 +67,139 @@ const SYSTEM_INSTRUCTION = `
 而应该是：“【角色设定】你是一名资深 Python 数据工程师... 【任务】编写高效率、带注释的 Pandas 脚本... 【约束】必须处理文件不存在的异常... 【格式】使用 Markdown 代码块...”
 `;
 
-// Initialize the client. API Key is injected via environment variable.
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+// Interface for unified AI Session
+export interface IAISession {
+  sendMessageStream(message: string, attachments: Attachment[], onChunk: (text: string) => void): Promise<string>;
+}
 
-export class OptimizerSession {
+// Helper to generate a short title (Non-streaming)
+export const generateChatTitle = async (firstMessage: string, settings: AISettings): Promise<string> => {
+  const prompt = `请将以下用户输入总结为一个极简短的标题（10个汉字以内），用于历史记录列表。不要包含标点符号，不要包含“关于”、“请求”等冗余词汇。直接输出标题内容。\n\n用户输入：${firstMessage}`;
+
+  try {
+    if (settings.provider === 'gemini') {
+      const apiKey = settings.apiKey || process.env.API_KEY;
+      if (!apiKey) return firstMessage.slice(0, 20);
+
+      const ai = new GoogleGenAI({ apiKey });
+      
+      const response = await ai.models.generateContent({
+        model: settings.model || 'gemini-3-pro-preview',
+        contents: prompt,
+        config: {
+          systemInstruction: "你是一个专业的摘要助手。",
+          temperature: settings.temperature,
+        }
+      });
+      
+      const title = response.text;
+      return title ? title.trim().replace(/^["']|["']$/g, '') : firstMessage.slice(0, 20);
+    } else {
+      // OpenAI Compatible
+      if (!settings.apiKey || !settings.baseUrl) return firstMessage.slice(0, 20);
+
+      const baseUrl = settings.baseUrl?.replace(/\/+$/, '');
+      const response = await fetch(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${settings.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: settings.model,
+          messages: [
+            { role: 'system', content: '你是一个专业的摘要助手。' },
+            { role: 'user', content: prompt }
+          ],
+          stream: false,
+          max_tokens: 50,
+          temperature: settings.temperature,
+        }),
+      });
+
+      if (!response.ok) return firstMessage.slice(0, 20);
+      const data = await response.json();
+      const title = data.choices?.[0]?.message?.content;
+      return title ? title.trim().replace(/^["']|["']$/g, '') : firstMessage.slice(0, 20);
+    }
+  } catch (error) {
+    console.error("Title generation failed:", error);
+    return firstMessage.slice(0, 20);
+  }
+};
+
+// --- Implementation 1: Google Gemini (Official SDK) ---
+class GeminiSession implements IAISession {
   private chat: Chat;
 
-  constructor(historyMessages: ChatMessage[] = []) {
-    // Convert app ChatMessage format to Gemini SDK Content format
-    const history: Content[] = historyMessages.map(msg => ({
-      role: msg.role,
-      parts: [{ text: msg.content }]
-    }));
+  constructor(settings: AISettings, historyMessages: ChatMessage[]) {
+    // Use environment key if settings key is empty
+    const apiKey = settings.apiKey || process.env.API_KEY;
+    if (!apiKey) throw new Error("API Key is missing for Gemini");
 
-    // Use 'gemini-3-pro-preview' for complex text tasks like prompt engineering and reasoning.
+    const ai = new GoogleGenAI({ apiKey });
+
+    // Convert ChatMessage history to Gemini Content format
+    const history: Content[] = historyMessages.map(msg => {
+      const parts: Part[] = [{ text: msg.content }];
+      
+      // Add historical attachments if they exist
+      if (msg.attachments && msg.attachments.length > 0) {
+          msg.attachments.forEach(att => {
+              parts.push({
+                  inlineData: {
+                      mimeType: att.mimeType,
+                      data: att.data
+                  }
+              });
+          });
+      }
+      
+      return {
+        role: msg.role,
+        parts: parts
+      };
+    });
+
     this.chat = ai.chats.create({
-      model: 'gemini-3-pro-preview',
+      model: settings.model || 'gemini-3-pro-preview',
       history: history,
       config: {
         systemInstruction: SYSTEM_INSTRUCTION,
-        // Increase output token limit to prevent truncation on long prompts
-        maxOutputTokens: 32768,
-        // Enable thinking to improve reasoning capabilities for complex prompt optimization
-        thinkingConfig: {
+        maxOutputTokens: settings.maxOutputTokens || 32768,
+        temperature: settings.temperature,
+        topP: settings.topP,
+        thinkingConfig: settings.model.includes('thinking') || settings.model.includes('pro') ? {
           thinkingBudget: 4096, 
-        }
+        } : undefined
       },
     });
   }
 
-  async sendMessageStream(
-    message: string, 
-    onChunk: (text: string) => void
-  ): Promise<string> {
+  async sendMessageStream(message: string, attachments: Attachment[], onChunk: (text: string) => void): Promise<string> {
     try {
-      const resultStream = await this.chat.sendMessageStream({ message });
+      // Construct parts for the current message
+      const parts: Part[] = [];
+      
+      // Add text part (if exists)
+      if (message) {
+        parts.push({ text: message });
+      }
+
+      // Add attachments
+      if (attachments && attachments.length > 0) {
+          attachments.forEach(att => {
+             parts.push({
+                 inlineData: {
+                     mimeType: att.mimeType,
+                     data: att.data
+                 }
+             });
+          });
+      }
+
+      // Send (if just attachments, message might be empty, which Gemini supports via parts)
+      const resultStream = await this.chat.sendMessageStream({ message: parts });
       
       let fullText = '';
       for await (const chunk of resultStream) {
@@ -113,12 +211,159 @@ export class OptimizerSession {
         }
       }
       return fullText;
-
     } catch (error) {
-      console.error("Gemini Optimization Error:", error);
+      console.error("Gemini Error:", error);
       throw error;
     }
   }
 }
 
-export const createOptimizerSession = (history?: ChatMessage[]) => new OptimizerSession(history);
+// --- Implementation 2: OpenAI Compatible (Fetch / SSE) ---
+class OpenAICompatibleSession implements IAISession {
+  private settings: AISettings;
+  private history: any[];
+
+  constructor(settings: AISettings, historyMessages: ChatMessage[]) {
+    this.settings = settings;
+    if (!this.settings.apiKey) throw new Error("API Key is missing");
+    if (!this.settings.baseUrl) throw new Error("Base URL is missing");
+
+    this.history = historyMessages.map(msg => this.formatMessage(msg.role, msg.content, msg.attachments));
+  }
+
+  // Helper to format messages for OpenAI API (support Vision)
+  private formatMessage(role: string, content: string, attachments?: Attachment[]) {
+    const apiRole = role === 'model' ? 'assistant' : 'user';
+    
+    // Simple text message
+    if (!attachments || attachments.length === 0) {
+        return { role: apiRole, content: content };
+    }
+
+    // Multimodal message (array content)
+    const contentParts: any[] = [];
+    
+    if (content) {
+        contentParts.push({ type: 'text', text: content });
+    }
+
+    attachments.forEach(att => {
+        if (att.mimeType.startsWith('image/')) {
+            contentParts.push({
+                type: 'image_url',
+                image_url: {
+                    url: `data:${att.mimeType};base64,${att.data}`
+                }
+            });
+        } 
+        // Note: Standard OpenAI Vision doesn't strictly support PDF via image_url, 
+        // but some proxies might, or we just ignore non-images here to prevent 400 errors.
+        // For strict OpenAI, we'd need to convert PDF pages to images. 
+        // For now, we skip non-image attachments for OpenAI-compatible to ensure stability.
+    });
+
+    return { role: apiRole, content: contentParts };
+  }
+
+  async sendMessageStream(message: string, attachments: Attachment[], onChunk: (text: string) => void): Promise<string> {
+    const newMessage = this.formatMessage('user', message, attachments);
+    
+    const messages = [
+      { role: 'system', content: SYSTEM_INSTRUCTION },
+      ...this.history,
+      newMessage
+    ];
+
+    try {
+      const baseUrl = this.settings.baseUrl?.replace(/\/+$/, '');
+      const url = `${baseUrl}/chat/completions`;
+
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${this.settings.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: this.settings.model,
+          messages: messages,
+          stream: true,
+          temperature: this.settings.temperature,
+          max_tokens: this.settings.maxOutputTokens,
+          top_p: this.settings.topP,
+        }),
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`API Error: ${response.status} - ${errText}`);
+      }
+
+      if (!response.body) throw new Error("Response body is empty");
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let fullText = '';
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value, { stream: true });
+        buffer += chunk;
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || ''; 
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data: ')) continue;
+          
+          const dataStr = trimmed.slice(6);
+          if (dataStr === '[DONE]') continue;
+
+          try {
+            const data = JSON.parse(dataStr);
+            const content = data.choices?.[0]?.delta?.content || data.choices?.[0]?.delta?.reasoning_content || ''; 
+            if (content) {
+              fullText += content;
+              onChunk(fullText);
+            }
+          } catch (e) {
+            console.warn("Failed to parse SSE JSON:", e);
+          }
+        }
+      }
+
+      // Update internal history
+      this.history.push(newMessage);
+      this.history.push({ role: 'assistant', content: fullText });
+
+      return fullText;
+
+    } catch (error) {
+      console.error("OpenAI Compatible API Error:", error);
+      throw error;
+    }
+  }
+}
+
+export const createAISession = (
+  history: ChatMessage[] = [],
+  settings?: AISettings
+): IAISession => {
+  if (!settings || settings.provider === 'gemini') {
+    return new GeminiSession(
+      settings || { 
+        provider: 'gemini', 
+        apiKey: '', 
+        model: 'gemini-3-pro-preview', 
+        temperature: 0.7 
+      }, 
+      history
+    );
+  }
+  return new OpenAICompatibleSession(settings, history);
+};
+
+export type { IAISession as OptimizerSession };

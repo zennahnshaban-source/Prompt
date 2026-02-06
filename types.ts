@@ -1,6 +1,13 @@
 
+export interface Attachment {
+  mimeType: string;
+  data: string; // Base64 string
+  name?: string;
+}
+
 export interface OptimizationRequest {
   rawPrompt: string;
+  attachments?: Attachment[];
 }
 
 export interface OptimizationResult {
@@ -19,6 +26,7 @@ export interface ChatMessage {
   id: string;
   role: 'user' | 'model';
   content: string;
+  attachments?: Attachment[]; // Add attachments support
   isStreaming?: boolean;
   timestamp: number;
 }
@@ -36,4 +44,16 @@ export interface PromptTemplate {
   description: string;
   content: string;
   lastModified: number;
+}
+
+export type AIProvider = 'gemini' | 'openai' | 'deepseek' | 'moonshot' | 'yi' | 'siliconflow' | 'openrouter' | 'custom';
+
+export interface AISettings {
+  provider: AIProvider;
+  apiKey: string;
+  baseUrl?: string;
+  model: string;
+  temperature: number;
+  maxOutputTokens?: number;
+  topP?: number;
 }

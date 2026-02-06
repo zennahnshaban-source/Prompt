@@ -4,9 +4,10 @@ import PromptInput from './components/PromptInput';
 import ChatBubble from './components/ChatBubble';
 import HistorySidebar from './components/HistorySidebar';
 import TemplateModal from './components/TemplateModal';
-import { createOptimizerSession, OptimizerSession } from './services/geminiService';
-import { OptimizationStatus, ChatMessage, HistorySession, PromptTemplate } from './types';
-import { SparklesIcon, MenuIcon, XIcon, ArrowRightIcon } from './components/Icons';
+import SettingsModal from './components/SettingsModal';
+import { createAISession, OptimizerSession, generateChatTitle } from './services/geminiService';
+import { OptimizationStatus, ChatMessage, HistorySession, PromptTemplate, AISettings, Attachment } from './types';
+import { SparklesIcon, MenuIcon, XIcon, ArrowRightIcon, SidebarIcon } from './components/Icons';
 
 const EXAMPLES = [
   {
@@ -29,6 +30,14 @@ const EXAMPLES = [
 
 const HISTORY_STORAGE_KEY = 'prompt_alchemy_history';
 const TEMPLATES_STORAGE_KEY = 'prompt_alchemy_templates';
+const SETTINGS_STORAGE_KEY = 'prompt_alchemy_settings';
+
+const DEFAULT_SETTINGS: AISettings = {
+  provider: 'gemini',
+  apiKey: '', // Defaults to env if empty in service
+  model: 'gemini-3-pro-preview',
+  temperature: 0.7,
+};
 
 const App: React.FC = () => {
   // --- Chat State ---
@@ -47,6 +56,10 @@ const App: React.FC = () => {
   const [isTemplateModalOpen, setIsTemplateModalOpen] = useState(false);
   const [editingTemplate, setEditingTemplate] = useState<PromptTemplate | null>(null);
 
+  // --- Settings State ---
+  const [settings, setSettings] = useState<AISettings>(DEFAULT_SETTINGS);
+  const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+
   // --- Refs ---
   const sessionRef = useRef<OptimizerSession | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -59,6 +72,11 @@ const App: React.FC = () => {
 
       const storedTemplates = localStorage.getItem(TEMPLATES_STORAGE_KEY);
       if (storedTemplates) setTemplates(JSON.parse(storedTemplates));
+
+      const storedSettings = localStorage.getItem(SETTINGS_STORAGE_KEY);
+      if (storedSettings) {
+        setSettings({ ...DEFAULT_SETTINGS, ...JSON.parse(storedSettings) });
+      }
     } catch (e) {
       console.error("Failed to load local storage data", e);
     }
@@ -75,12 +93,18 @@ const App: React.FC = () => {
     localStorage.setItem(TEMPLATES_STORAGE_KEY, JSON.stringify(templates));
   }, [templates]);
 
+  useEffect(() => {
+    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+    // Reset session when settings change to force new config
+    sessionRef.current = null;
+  }, [settings]);
+
   // --- Initial Session ---
   useEffect(() => {
     if (!sessionRef.current) {
-        sessionRef.current = createOptimizerSession();
+        sessionRef.current = createAISession([], settings);
     }
-  }, []);
+  }, [settings]);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -96,7 +120,7 @@ const App: React.FC = () => {
     setStatus(OptimizationStatus.IDLE);
     setError(null);
     setCurrentSessionId(null);
-    sessionRef.current = createOptimizerSession(); 
+    sessionRef.current = createAISession([], settings); 
     if (window.innerWidth < 768) setIsSidebarOpen(false);
   };
 
@@ -105,7 +129,7 @@ const App: React.FC = () => {
     setCurrentSessionId(session.id);
     setStatus(OptimizationStatus.SUCCESS);
     setError(null);
-    sessionRef.current = createOptimizerSession(session.messages);
+    sessionRef.current = createAISession(session.messages, settings);
   };
 
   const handleDeleteSession = (sessionId: string, e: React.MouseEvent) => {
@@ -159,17 +183,21 @@ const App: React.FC = () => {
   };
 
   // --- Optimization Logic ---
-  const handleOptimize = async (userPrompt: string) => {
+  const handleOptimize = async (userPrompt: string, attachments: Attachment[] = []) => {
     setStatus(OptimizationStatus.LOADING);
     setError(null);
 
     let activeSessionId = currentSessionId;
+    let isNewSession = false;
+
     if (!activeSessionId) {
+      isNewSession = true;
       activeSessionId = Date.now().toString();
       setCurrentSessionId(activeSessionId);
       const newSession: HistorySession = {
           id: activeSessionId,
-          title: userPrompt.slice(0, 20) + (userPrompt.length > 20 ? '...' : ''),
+          // Initial temp title, will be updated by AI
+          title: userPrompt ? (userPrompt.slice(0, 20) + (userPrompt.length > 20 ? '...' : '')) : '新对话',
           messages: [],
           lastModified: Date.now()
       };
@@ -180,6 +208,7 @@ const App: React.FC = () => {
       id: Date.now().toString(),
       role: 'user',
       content: userPrompt,
+      attachments: attachments, // Store attachments
       timestamp: Date.now(),
     };
     
@@ -195,12 +224,26 @@ const App: React.FC = () => {
     const newMessages = [...messages, userMessage, aiPlaceholder];
     setMessages(newMessages);
 
+    // Ensure session is created with latest messages and settings
     if (!sessionRef.current) {
-        sessionRef.current = createOptimizerSession(messages);
+        sessionRef.current = createAISession(newMessages.slice(0, -1), settings);
+    }
+
+    // Trigger title generation in background for new sessions (only if text exists)
+    if (isNewSession && userPrompt) {
+      generateChatTitle(userPrompt, settings).then((aiTitle) => {
+        setSessions(prev => prev.map(s => 
+          s.id === activeSessionId 
+            ? { ...s, title: aiTitle } 
+            : s
+        ));
+      }).catch(err => {
+        console.warn("Failed to generate AI title", err);
+      });
     }
 
     try {
-      await sessionRef.current.sendMessageStream(userPrompt, (chunk) => {
+      await sessionRef.current.sendMessageStream(userPrompt, attachments, (chunk) => {
         setMessages(prev => {
             const updated = prev.map(msg => 
                 msg.id === aiMessageId ? { ...msg, content: chunk } : msg
@@ -229,17 +272,17 @@ const App: React.FC = () => {
     } catch (err: any) {
       console.error(err);
       setStatus(OptimizationStatus.ERROR);
-      setError("生成响应失败，请重试。");
+      setError(err.message || "生成响应失败，请检查设置或网络连接。");
       setMessages(prev => prev.filter(msg => msg.id !== aiMessageId));
     }
   };
 
   return (
-    <div className="flex h-screen bg-slate-50 text-slate-800 font-sans overflow-hidden">
-      {/* Background ambient glow */}
+    <div className="flex h-screen bg-[#F8FAFC] text-slate-800 font-sans overflow-hidden">
+      {/* Background ambient glow - Subtler */}
       <div className="fixed top-0 left-0 w-full h-full overflow-hidden pointer-events-none z-0">
-          <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-indigo-200/40 rounded-full blur-[120px]"></div>
-          <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] bg-violet-200/40 rounded-full blur-[120px]"></div>
+          <div className="absolute top-[-20%] left-[-10%] w-[50%] h-[50%] bg-indigo-100/40 rounded-full blur-[150px]"></div>
+          <div className="absolute bottom-[-20%] right-[-10%] w-[50%] h-[50%] bg-violet-100/40 rounded-full blur-[150px]"></div>
       </div>
 
       <HistorySidebar 
@@ -257,84 +300,104 @@ const App: React.FC = () => {
         onCreateTemplate={handleCreateTemplate}
         onEditTemplate={handleEditTemplate}
         onDeleteTemplate={handleDeleteTemplate}
+        // Settings Props
+        onOpenSettings={() => setIsSettingsModalOpen(true)}
       />
 
-      {/* Template Modal */}
+      {/* Modals */}
       <TemplateModal 
         isOpen={isTemplateModalOpen}
         onClose={() => setIsTemplateModalOpen(false)}
         onSave={handleSaveTemplate}
         initialTemplate={editingTemplate}
       />
+      
+      <SettingsModal 
+        isOpen={isSettingsModalOpen}
+        onClose={() => setIsSettingsModalOpen(false)}
+        settings={settings}
+        onSave={setSettings}
+      />
 
-      <div className="relative z-10 flex flex-col flex-1 h-full min-w-0 bg-white/50 backdrop-blur-sm shadow-xl border-l border-slate-200/50 transition-all">
+      <div className="relative z-10 flex flex-col flex-1 h-full min-w-0 bg-white/30 backdrop-blur-sm transition-all">
         
-        {/* Toggle Sidebar */}
-        <div className="absolute top-6 left-4 z-50">
+        {/* Toggle Sidebar Button for Mobile and Desktop */}
+        <div className="absolute top-4 left-4 z-50">
              <button 
                 onClick={() => setIsSidebarOpen(!isSidebarOpen)}
-                className={`p-2 rounded-lg bg-white/80 border border-slate-200 shadow-sm text-slate-500 hover:text-indigo-600 transition-colors ${isSidebarOpen ? 'md:hidden' : ''}`}
+                className="p-2.5 rounded-xl bg-white/90 border border-slate-200 shadow-sm text-slate-500 hover:text-indigo-600 transition-colors"
+                title={isSidebarOpen ? "收起侧边栏" : "展开侧边栏"}
              >
-                 {isSidebarOpen ? <XIcon className="w-5 h-5"/> : <MenuIcon className="w-5 h-5"/>}
+                 {isSidebarOpen ? <SidebarIcon className="w-5 h-5"/> : <SidebarIcon className="w-5 h-5 opacity-70"/>}
              </button>
         </div>
 
-        <Header onReset={handleNewChat} />
+        <Header 
+          onReset={handleNewChat} 
+          settings={settings}
+          onOpenSettings={() => setIsSettingsModalOpen(true)}
+        />
 
-        <main className="flex-1 overflow-y-auto custom-scrollbar px-4 sm:px-6 lg:px-8 py-4">
-          {messages.length === 0 ? (
-            <div className="h-full flex flex-col items-center justify-center p-4 pb-20">
-               <div className="text-center opacity-80 mb-8">
-                  <div className="w-20 h-20 bg-white rounded-2xl flex items-center justify-center mb-6 mx-auto shadow-md border border-slate-100">
-                      <SparklesIcon className="w-10 h-10 text-indigo-500" />
-                  </div>
-                  <h3 className="text-xl font-semibold text-slate-700 mb-2">Prompt 炼金术</h3>
-                  <p className="max-w-md mx-auto text-sm leading-relaxed text-slate-500">
-                    在下方输入您的原始 Prompt 想法，或使用左侧的“我的模板”。<br/>
-                    我们将把它转化为专业级指令。
-                  </p>
-               </div>
-
-               <div className="grid grid-cols-1 md:grid-cols-2 gap-3 w-full max-w-2xl animate-[fadeIn_0.5s_ease-out]">
-                 {EXAMPLES.map((ex, i) => (
-                   <button 
-                     key={i}
-                     onClick={() => handleOptimize(ex.text)}
-                     disabled={status === OptimizationStatus.LOADING}
-                     className="text-left p-4 rounded-xl border border-slate-200 bg-white/80 hover:bg-white hover:border-indigo-300 hover:shadow-md hover:-translate-y-0.5 transition-all duration-200 group disabled:opacity-50 disabled:cursor-not-allowed"
-                   >
-                     <div className="font-semibold text-slate-700 text-sm mb-1 group-hover:text-indigo-600 transition-colors flex items-center justify-between">
-                        {ex.label}
-                        <span className="opacity-0 group-hover:opacity-100 transition-opacity text-indigo-400">
-                          <ArrowRightIcon className="w-4 h-4" />
-                        </span>
-                     </div>
-                     <div className="text-xs text-slate-500 line-clamp-2 leading-relaxed">{ex.text}</div>
-                   </button>
-                 ))}
-               </div>
-            </div>
-          ) : (
-            <div className="flex flex-col pb-4 max-w-4xl mx-auto w-full">
-              {messages.map((msg) => (
-                <ChatBubble key={msg.id} message={msg} />
-              ))}
-              {error && (
-                 <div className="mx-auto mt-4 p-3 bg-red-50 border border-red-100 rounded-lg text-red-600 text-sm text-center max-w-md">
-                     {error}
+        <main className="flex-1 overflow-y-auto custom-scrollbar px-4 sm:px-6 lg:px-8 py-6" id="chat-container">
+          <div className="max-w-3xl mx-auto h-full flex flex-col">
+            {messages.length === 0 ? (
+              <div className="flex-1 flex flex-col items-center justify-center p-4 pb-20">
+                 <div className="text-center mb-10 relative">
+                    <div className="absolute -inset-4 bg-gradient-to-r from-indigo-500/10 to-violet-500/10 rounded-full blur-xl"></div>
+                    <div className="relative w-24 h-24 bg-white rounded-3xl flex items-center justify-center mb-6 mx-auto shadow-xl shadow-indigo-100 border border-indigo-50 transform rotate-3 transition-transform hover:rotate-0 duration-500">
+                        <SparklesIcon className="w-12 h-12 text-indigo-600" />
+                    </div>
+                    <h3 className="text-2xl font-bold text-slate-800 mb-3 tracking-tight">Prompt 炼金术</h3>
+                    <p className="max-w-md mx-auto text-base text-slate-500 leading-relaxed">
+                      将您的原始想法转化为<span className="text-indigo-600 font-medium">企业级 AI 指令</span>。<br/>
+                      支持 Claude, ChatGPT, Gemini, DeepSeek 等主流模型。
+                    </p>
+                    {/* Badge removed here as it is now in Header */}
                  </div>
-              )}
-              <div ref={messagesEndRef} />
-            </div>
-          )}
+
+                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4 w-full max-w-3xl animate-[fadeIn_0.5s_ease-out]">
+                   {EXAMPLES.map((ex, i) => (
+                     <button 
+                       key={i}
+                       onClick={() => handleOptimize(ex.text)}
+                       disabled={status === OptimizationStatus.LOADING}
+                       className="text-left p-5 rounded-2xl border border-slate-200 bg-white hover:bg-slate-50/50 hover:border-indigo-200 hover:shadow-lg hover:shadow-indigo-100/40 hover:-translate-y-1 transition-all duration-300 group disabled:opacity-50 disabled:cursor-not-allowed"
+                     >
+                       <div className="font-semibold text-slate-700 text-sm mb-2 group-hover:text-indigo-600 transition-colors flex items-center justify-between">
+                          {ex.label}
+                          <span className="text-indigo-200 group-hover:text-indigo-500 transition-colors transform group-hover:translate-x-1 duration-300">
+                            <ArrowRightIcon className="w-4 h-4" />
+                          </span>
+                       </div>
+                       <div className="text-xs text-slate-500 line-clamp-2 leading-relaxed opacity-80">{ex.text}</div>
+                     </button>
+                   ))}
+                 </div>
+              </div>
+            ) : (
+              <div className="flex flex-col pb-4 w-full">
+                {messages.map((msg) => (
+                  <ChatBubble key={msg.id} message={msg} />
+                ))}
+                {error && (
+                   <div className="mx-auto mt-4 p-4 bg-red-50 border border-red-100 rounded-xl text-red-600 text-sm text-center max-w-md shadow-sm">
+                       {error}
+                   </div>
+                )}
+                <div ref={messagesEndRef} className="h-4" />
+              </div>
+            )}
+          </div>
         </main>
 
-        <PromptInput 
-          onOptimize={handleOptimize} 
-          status={status} 
-          externalValue={inputPayload}
-          onExternalValueConsumed={() => setInputPayload('')}
-        />
+        <div className="flex-shrink-0">
+            <PromptInput 
+              onOptimize={handleOptimize} 
+              status={status} 
+              externalValue={inputPayload}
+              onExternalValueConsumed={() => setInputPayload('')}
+            />
+        </div>
       </div>
     </div>
   );
